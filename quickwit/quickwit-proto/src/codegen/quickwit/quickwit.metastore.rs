@@ -231,6 +231,13 @@ pub struct PublishSplitsRequest {
     >,
     #[prost(string, optional, tag = "5")]
     pub publish_token_opt: ::core::option::Option<::prost::alloc::string::String>,
+    /// When set, the request carries the metadata of the splits to stage, so a metastore can
+    /// stage and publish them in a single durable mutation instead of requiring a prior
+    /// `StageSplits` call. Callers that already staged their splits leave it unset.
+    #[prost(string, optional, tag = "6")]
+    pub split_metadata_list_serialized_json_opt: ::core::option::Option<
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

@@ -265,6 +265,36 @@ impl FileBackedIndex {
         Ok(())
     }
 
+    /// Stages several splits, mirroring the metastore's `stage_splits`. Used to stage and publish a
+    /// batch of splits in a single mutation.
+    pub(crate) fn stage_splits(
+        &mut self,
+        splits_metadata: impl IntoIterator<Item = SplitMetadata>,
+    ) -> Result<(), MetastoreError> {
+        let mut failed_split_ids = Vec::new();
+        for split_metadata in splits_metadata {
+            match self.stage_split(split_metadata) {
+                Ok(()) => {}
+                Err(MetastoreError::FailedPrecondition {
+                    entity: EntityKind::Split { split_id },
+                    ..
+                }) => {
+                    failed_split_ids.push(split_id);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !failed_split_ids.is_empty() {
+            let entity = EntityKind::Splits {
+                split_ids: failed_split_ids,
+            };
+            let message = "splits are not staged".to_string();
+            Err(MetastoreError::FailedPrecondition { entity, message })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Marks the splits for deletion. Returns whether a mutation occurred.
     pub(crate) fn mark_splits_for_deletion(
         &mut self,

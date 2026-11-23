@@ -586,11 +586,23 @@ pub trait PublishSplitsRequestExt {
     /// Deserializes the `index_checkpoint_delta_json_opt` field of a [`PublishSplitsRequest`] into
     /// an [`Option<IndexCheckpointDelta>`].
     fn deserialize_index_checkpoint(&self) -> MetastoreResult<Option<IndexCheckpointDelta>>;
+
+    /// Deserializes the optional `split_metadata_list_serialized_json_opt` field of a
+    /// [`PublishSplitsRequest`] into a list of [`SplitMetadata`]. Returns `None` when the request
+    /// does not carry split metadata (the splits were staged by a prior `StageSplits` call).
+    fn deserialize_splits_metadata_opt(&self) -> MetastoreResult<Option<Vec<SplitMetadata>>>;
 }
 
 impl PublishSplitsRequestExt for PublishSplitsRequest {
     fn deserialize_index_checkpoint(&self) -> MetastoreResult<Option<IndexCheckpointDelta>> {
         self.index_checkpoint_delta_json_opt
+            .as_ref()
+            .map(|value| serde_utils::from_json_str(value))
+            .transpose()
+    }
+
+    fn deserialize_splits_metadata_opt(&self) -> MetastoreResult<Option<Vec<SplitMetadata>>> {
+        self.split_metadata_list_serialized_json_opt
             .as_ref()
             .map(|value| serde_utils::from_json_str(value))
             .transpose()

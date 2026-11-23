@@ -781,6 +781,13 @@ impl MetastoreService for PostgresqlMetastore {
         let checkpoint_delta_opt: Option<IndexCheckpointDelta> =
             request.deserialize_index_checkpoint()?;
         let index_uid: IndexUid = request.index_uid().clone();
+        // When the request carries the split metadata, the caller skipped the pre-upload
+        // `StageSplits`; stage the splits here before publishing them.
+        if let Some(splits_metadata) = request.deserialize_splits_metadata_opt()? {
+            let stage_splits_request =
+                StageSplitsRequest::try_from_splits_metadata(index_uid.clone(), splits_metadata)?;
+            self.stage_splits(stage_splits_request).await?;
+        }
         let staged_split_ids = request.staged_split_ids;
         let replaced_split_ids = request.replaced_split_ids;
 

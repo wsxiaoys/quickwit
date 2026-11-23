@@ -824,6 +824,7 @@ pub async fn test_metastore_apply_checkpoint_delta_v2_single_shard<
         replaced_split_ids: Vec::new(),
         index_checkpoint_delta_json_opt: Some(index_checkpoint_delta_json),
         publish_token_opt: Some("test-publish-token-foo".to_string()),
+        split_metadata_list_serialized_json_opt: None,
     };
     let error = metastore
         .publish_splits(publish_splits_request)
@@ -857,6 +858,7 @@ pub async fn test_metastore_apply_checkpoint_delta_v2_single_shard<
         replaced_split_ids: Vec::new(),
         index_checkpoint_delta_json_opt: Some(index_checkpoint_delta_json),
         publish_token_opt: Some("test-publish-token-foo".to_string()),
+        split_metadata_list_serialized_json_opt: None,
     };
     let error = metastore
         .publish_splits(publish_splits_request.clone())
@@ -871,6 +873,7 @@ pub async fn test_metastore_apply_checkpoint_delta_v2_single_shard<
         replaced_split_ids: Vec::new(),
         index_checkpoint_delta_json_opt: Some(index_checkpoint_delta_json),
         publish_token_opt: Some("test-publish-token-bar".to_string()),
+        split_metadata_list_serialized_json_opt: None,
     };
     metastore
         .publish_splits(publish_splits_request.clone())
@@ -898,6 +901,7 @@ pub async fn test_metastore_apply_checkpoint_delta_v2_single_shard<
         replaced_split_ids: Vec::new(),
         index_checkpoint_delta_json_opt: Some(index_checkpoint_delta_json),
         publish_token_opt: Some("test-publish-token-bar".to_string()),
+        split_metadata_list_serialized_json_opt: None,
     };
     let error = metastore
         .publish_splits(publish_splits_request.clone())
@@ -926,6 +930,7 @@ pub async fn test_metastore_apply_checkpoint_delta_v2_single_shard<
         replaced_split_ids: Vec::new(),
         index_checkpoint_delta_json_opt: Some(index_checkpoint_delta_json),
         publish_token_opt: Some("test-publish-token-bar".to_string()),
+        split_metadata_list_serialized_json_opt: None,
     };
     metastore
         .publish_splits(publish_splits_request)
@@ -1037,6 +1042,7 @@ pub async fn test_metastore_apply_checkpoint_delta_v2_multi_shards<
         replaced_split_ids: Vec::new(),
         index_checkpoint_delta_json_opt: Some(index_checkpoint_delta_json),
         publish_token_opt: Some("test-publish-token-foo".to_string()),
+        split_metadata_list_serialized_json_opt: None,
     };
     metastore
         .publish_splits(publish_splits_request)

@@ -679,8 +679,16 @@ impl MetastoreService for FileBackedMetastore {
     ) -> MetastoreResult<EmptyResponse> {
         let index_checkpoint_delta: Option<IndexCheckpointDelta> =
             request.deserialize_index_checkpoint()?;
+        // When the request carries the split metadata, the splits are staged and published in a
+        // single mutation (one lock acquisition, one durable write) instead of requiring a prior
+        // `stage_splits`. Staging happens before the checkpoint delta / publish token is applied,
+        // preserving the original `stage_splits` then `publish_splits` ordering.
+        let staged_splits_metadata_opt = request.deserialize_splits_metadata_opt()?;
         let index_uid = request.index_uid().clone();
         self.mutate(&index_uid, |index| {
+            if let Some(splits_metadata) = staged_splits_metadata_opt {
+                index.stage_splits(splits_metadata)?;
+            }
             index.publish_splits(
                 request.staged_split_ids,
                 request.replaced_split_ids,
@@ -1415,6 +1423,141 @@ mod tests {
     }
 
     metastore_test_suite!(crate::FileBackedMetastore);
+
+    /// The coalesced `publish_splits` (split metadata carried in the request) must leave the index
+    /// in the same state as the two-mutation `stage_splits` + `publish_splits` sequence.
+    #[tokio::test]
+    async fn test_file_backed_metastore_coalesced_stage_and_publish_matches_two_step() {
+        use quickwit_config::{SourceConfig, SourceParams};
+        use quickwit_proto::metastore::{IndexMetadataRequest, PublishSplitsRequest};
+
+        use crate::checkpoint::IndexCheckpointDelta;
+        use crate::{
+            CreateIndexRequestExt, IndexMetadataResponseExt, ListSplitsRequestExt,
+            StageSplitsRequestExt,
+        };
+
+        let index_id = "test-coalesced-publish";
+        let source_id = format!("{index_id}--source");
+        let index_uri = format!("ram:///indexes/{index_id}");
+
+        let new_metastore = || async {
+            let metastore = FileBackedMetastore::try_new(Arc::new(RamStorage::default()), None)
+                .await
+                .unwrap();
+            let index_config = IndexConfig::for_test(index_id, &index_uri);
+            let source_configs = &[SourceConfig::for_test(&source_id, SourceParams::void())];
+            let create_index_request = CreateIndexRequest::try_from_index_and_source_configs(
+                &index_config,
+                source_configs,
+            )
+            .unwrap();
+            let index_uid: IndexUid = metastore
+                .create_index(create_index_request)
+                .await
+                .unwrap()
+                .index_uid()
+                .clone();
+            (metastore, index_uid)
+        };
+
+        let split_metadata_list: Vec<SplitMetadata> = (1..=3)
+            .map(|i| SplitMetadata {
+                split_id: format!("{index_id}--split-{i}").into(),
+                index_uid: IndexUid::for_test(index_id, 0),
+                ..Default::default()
+            })
+            .collect();
+        let split_ids: Vec<String> = split_metadata_list
+            .iter()
+            .map(|split| split.split_id.to_string())
+            .collect();
+        let checkpoint_delta = IndexCheckpointDelta::for_test(&source_id, 0..100);
+        let checkpoint_delta_json = serde_json::to_string(&checkpoint_delta).unwrap();
+
+        // Path A: two mutations, `stage_splits` then `publish_splits`.
+        let (metastore_a, index_uid_a) = new_metastore().await;
+        let stage_splits_request = StageSplitsRequest::try_from_splits_metadata(
+            index_uid_a.clone(),
+            split_metadata_list.clone(),
+        )
+        .unwrap();
+        metastore_a.stage_splits(stage_splits_request).await.unwrap();
+        metastore_a
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid_a.clone()),
+                staged_split_ids: split_ids.clone(),
+                index_checkpoint_delta_json_opt: Some(checkpoint_delta_json.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Path B: one coalesced mutation carrying the split metadata.
+        let (metastore_b, index_uid_b) = new_metastore().await;
+        metastore_b
+            .publish_splits(PublishSplitsRequest {
+                index_uid: Some(index_uid_b.clone()),
+                staged_split_ids: split_ids.clone(),
+                index_checkpoint_delta_json_opt: Some(checkpoint_delta_json.clone()),
+                split_metadata_list_serialized_json_opt: Some(
+                    serde_json::to_string(&split_metadata_list).unwrap(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        async fn published_splits(
+            metastore: &FileBackedMetastore,
+            index_uid: &IndexUid,
+        ) -> Vec<String> {
+            let mut splits = metastore
+                .list_splits(
+                    ListSplitsRequest::try_from_list_splits_query(&ListSplitsQuery::for_index(
+                        index_uid.clone(),
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .collect_splits()
+                .await
+                .unwrap();
+            splits.sort_by(|left, right| left.split_id().cmp(right.split_id()));
+            splits
+                .into_iter()
+                .map(|split| {
+                    assert_eq!(split.split_state, SplitState::Published);
+                    serde_json::to_string(&split.split_metadata).unwrap()
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            published_splits(&metastore_a, &index_uid_a).await,
+            published_splits(&metastore_b, &index_uid_b).await
+        );
+
+        let checkpoint_a = metastore_a
+            .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+            .await
+            .unwrap()
+            .deserialize_index_metadata()
+            .unwrap()
+            .checkpoint;
+        let checkpoint_b = metastore_b
+            .index_metadata(IndexMetadataRequest::for_index_id(index_id.to_string()))
+            .await
+            .unwrap()
+            .deserialize_index_metadata()
+            .unwrap()
+            .checkpoint;
+        assert_eq!(
+            serde_json::to_string(&checkpoint_a).unwrap(),
+            serde_json::to_string(&checkpoint_b).unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn test_metastore_connectivity_and_endpoints() {
