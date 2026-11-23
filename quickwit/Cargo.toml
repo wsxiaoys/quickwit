@@ -396,6 +396,12 @@ tantivy-fst = "0.5"
 # used by reqwest.
 encoding_rs = "=0.8.35"
 
+[patch."https://github.com/quickwit-oss/mrecordlog"]
+# zstd-compress large WAL record payloads at the RecordWriter choke point
+# (decoder-compatible; the reader decompresses transparently).
+# See https://github.com/wsxiaoys/mrecordlog/pull/1
+mrecordlog = { git = "https://github.com/wsxiaoys/mrecordlog", rev = "9a3212d73b3adc359952eed8e1b9c97c95813ab6" }
+
 [patch.crates-io]
 sasl2-sys = { git = "https://github.com/quickwit-oss/rust-sasl/", rev = "085a4c7" }
 
