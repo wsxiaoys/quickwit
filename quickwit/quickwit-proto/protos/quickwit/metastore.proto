@@ -363,6 +363,10 @@ message PublishSplitsRequest {
   repeated string replaced_split_ids = 3;
   optional string index_checkpoint_delta_json_opt = 4;
   optional string publish_token_opt = 5;
+  // When set, the request carries the metadata of the splits to stage, so a metastore can
+  // stage and publish them in a single durable mutation instead of requiring a prior
+  // `StageSplits` call. Callers that already staged their splits leave it unset.
+  optional string split_metadata_list_serialized_json_opt = 6;
 }
 
 message MarkSplitsForDeletionRequest {
