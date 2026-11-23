@@ -16,6 +16,7 @@ use std::collections::hash_map::Entry;
 use std::num::NonZeroU32;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -65,6 +66,22 @@ pub(crate) const OTHER_PARTITION_ID: u64 = 3264326757911759461u64;
 #[derive(Debug)]
 struct CommitTimeout {
     workbench_id: Ulid,
+}
+
+/// Delay after which an input-drained pipeline commits its open workbench.
+///
+/// The periodic `commit_timeout` is armed when the workbench is created, so the last workbench of
+/// a load would otherwise wait out the whole timeout (30 s in the published regime) after the final
+/// document before its splits become searchable. This timer is short, but kept above the ingester's
+/// 1 s polling cool-down so a transient mid-run gap does not cut a split early.
+const TAIL_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cancellable companion to [`CommitTimeout`], armed from [`Indexer::on_drained_messages`] for the
+/// current workbench and invalidated by a newer generation (see `Indexer::tail_commit_generation`).
+#[derive(Debug)]
+struct TailCommitTimeout {
+    workbench_id: Ulid,
+    generation: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -376,6 +393,12 @@ pub struct Indexer {
     index_serializer_mailbox: Mailbox<IndexSerializer>,
     indexing_workbench_opt: Option<IndexingWorkbench>,
     counters: IndexerCounters,
+    /// Bumped on every incoming batch, so a [`TailCommitTimeout`] that predates the newest batch
+    /// is ignored and never cuts a split early.
+    tail_commit_generation: u64,
+    /// Generation a tail timer was last armed for. A drain caused by an *older* timer firing must
+    /// not re-arm and defer the commit, so the timer is armed at most once per generation.
+    tail_commit_armed_generation: Option<u64>,
 }
 
 #[async_trait]
@@ -423,6 +446,23 @@ impl Actor for Indexer {
         let Some(cooperative_indexing_period) =
             indexing_workbench.cooperative_indexing_period.take()
         else {
+            // Cooperative indexing is off: the open workbench would otherwise wait out the full
+            // `commit_timeout` after the last document. Arm a short, cancellable tail timer so an
+            // input-drained pipeline commits promptly; a new `ProcessedDocBatch` bumps the
+            // generation and invalidates it, so a mid-run gap never cuts a split early. Arm only
+            // once per generation: a drain caused by an older timer firing must not re-arm and
+            // defer the commit indefinitely.
+            if self.tail_commit_armed_generation != Some(self.tail_commit_generation) {
+                self.tail_commit_armed_generation = Some(self.tail_commit_generation);
+                let workbench_id = indexing_workbench.workbench_id;
+                ctx.schedule_self_msg(
+                    TAIL_COMMIT_TIMEOUT,
+                    TailCommitTimeout {
+                        workbench_id,
+                        generation: self.tail_commit_generation,
+                    },
+                );
+            }
             return Ok(());
         };
 
@@ -497,6 +537,31 @@ impl Handler<CommitTimeout> for Indexer {
 }
 
 #[async_trait]
+impl Handler<TailCommitTimeout> for Indexer {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        tail_commit_timeout: TailCommitTimeout,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        // A newer batch (or a newer drain) invalidated this timer; the workbench has moved on.
+        if tail_commit_timeout.generation != self.tail_commit_generation {
+            return Ok(());
+        }
+        let Some(indexing_workbench) = &self.indexing_workbench_opt else {
+            return Ok(());
+        };
+        if indexing_workbench.workbench_id != tail_commit_timeout.workbench_id {
+            return Ok(());
+        }
+        self.send_to_serializer(CommitTrigger::TailQuiescence, ctx)
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl Handler<ProcessedDocBatch> for Indexer {
     type Reply = ();
 
@@ -505,6 +570,8 @@ impl Handler<ProcessedDocBatch> for Indexer {
         doc_batch: ProcessedDocBatch,
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
+        // Any incoming batch invalidates a tail timer armed for the previous idle period.
+        self.tail_commit_generation = self.tail_commit_generation.wrapping_add(1);
         self.index_batch(doc_batch, ctx).await
     }
 }
@@ -578,6 +645,8 @@ impl Indexer {
             index_serializer_mailbox,
             indexing_workbench_opt: None,
             counters: IndexerCounters::default(),
+            tail_commit_generation: 0,
+            tail_commit_armed_generation: None,
         }
     }
 
@@ -1828,6 +1897,113 @@ mod tests {
             IndexCheckpointDelta::for_test("test-source", 4..8)
         );
 
+        universe.assert_quit().await;
+        Ok(())
+    }
+
+    fn quiescence_test_batch(body: &str, range: std::ops::Range<u64>) -> ProcessedDocBatch {
+        let doc_mapper = default_doc_mapper_for_test();
+        let body_field = doc_mapper.schema().get_field("body").unwrap();
+        ProcessedDocBatch::new(
+            vec![ProcessedDoc {
+                doc: doc!(body_field=>body),
+                fingerprint_opt: None,
+                timestamp_opt: None,
+                partition: 1,
+                num_bytes: 30,
+            }],
+            SourceCheckpointDelta::from_range(range),
+            false,
+        )
+    }
+
+    fn spawn_quiescence_test_indexer(
+        universe: &Universe,
+    ) -> (
+        Mailbox<Indexer>,
+        quickwit_actors::ActorHandle<Indexer>,
+        quickwit_actors::Inbox<IndexSerializer>,
+    ) {
+        let pipeline_id = IndexingPipelineId {
+            index_uid: IndexUid::new_with_random_ulid("test-index"),
+            source_id: "test-source".to_string(),
+            node_id: NodeId::from_str("test-node"),
+            pipeline_uid: PipelineUid::default(),
+        };
+        let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore.expect_publish_splits().never();
+        mock_metastore.expect_last_delete_opstamp().returning(
+            move |_last_delete_opstamp_request| Ok(LastDeleteOpstampResponse::new(10)),
+        );
+        let indexer = create_indexer_for_test(
+            pipeline_id,
+            Arc::new(default_doc_mapper_for_test()),
+            MetastoreServiceClient::from_mock(mock_metastore),
+            TempDirectory::for_test(),
+            IndexingSettings::for_test(),
+            // Cooperative indexing off: the tail timer is what commits the open workbench.
+            None,
+            index_serializer_mailbox,
+            None,
+        );
+        let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
+        (indexer_mailbox, indexer_handle, index_serializer_inbox)
+    }
+
+    /// Sleep past the tail timer without touching the actor: an `observe` is a message, and
+    /// processing one re-arms the tail timer, so polling in a loop would keep resetting it.
+    async fn sleep_past_tail_commit(universe: &Universe) {
+        universe
+            .sleep(TAIL_COMMIT_TIMEOUT + Duration::from_secs(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_indexer_commits_on_input_quiescence() -> anyhow::Result<()> {
+        let universe = Universe::new();
+        // The periodic commit timeout must not be what ends this test.
+        assert!(IndexingSettings::for_test().commit_timeout() > TAIL_COMMIT_TIMEOUT);
+        let (indexer_mailbox, indexer_handle, index_serializer_inbox) =
+            spawn_quiescence_test_indexer(&universe);
+        indexer_mailbox
+            .send_message(quiescence_test_batch("this is a test document", 0..1))
+            .await?;
+        sleep_past_tail_commit(&universe).await;
+        let indexer_counters = indexer_handle.observe().await.state;
+        assert_eq!(indexer_counters.num_splits_emitted, 1);
+        assert_eq!(indexer_counters.num_split_batches_emitted, 1);
+        let batches: Vec<IndexedSplitBatchBuilder> = index_serializer_inbox.drain_for_test_typed();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].commit_trigger, CommitTrigger::TailQuiescence);
+        assert_eq!(batches[0].splits[0].split_attrs.num_docs, 1);
+        universe.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_indexer_tail_commit_cancelled_by_new_batch() -> anyhow::Result<()> {
+        let universe = Universe::new();
+        let (indexer_mailbox, indexer_handle, index_serializer_inbox) =
+            spawn_quiescence_test_indexer(&universe);
+        indexer_mailbox
+            .send_message(quiescence_test_batch("first document", 0..1))
+            .await?;
+        // Let the first batch be indexed (and its tail timer armed) before sending the second,
+        // so this exercises cancellation rather than a single coalesced drain. Well under the
+        // 2 s tail delay, so the first timer cannot have fired yet.
+        universe.sleep(TAIL_COMMIT_TIMEOUT / 4).await;
+        indexer_mailbox
+            .send_message(quiescence_test_batch("second document", 1..2))
+            .await?;
+        sleep_past_tail_commit(&universe).await;
+        // One split, holding both docs: the timer armed for the first batch did not cut early.
+        let indexer_counters = indexer_handle.observe().await.state;
+        assert_eq!(indexer_counters.num_splits_emitted, 1);
+        let batches: Vec<IndexedSplitBatchBuilder> = index_serializer_inbox.drain_for_test_typed();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].commit_trigger, CommitTrigger::TailQuiescence);
+        assert_eq!(batches[0].splits[0].split_attrs.num_docs, 2);
         universe.assert_quit().await;
         Ok(())
     }

@@ -228,6 +228,7 @@ pub enum CommitTrigger {
     MemoryLimit,
     NoMoreDocs,
     NumDocsLimit,
+    TailQuiescence,
     Timeout,
 }
 
